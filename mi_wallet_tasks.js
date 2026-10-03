@@ -1,54 +1,34 @@
 /**
- * 小米钱包 - 玩家视界每日任务自动化脚本 (ES5 兼容版)
+ * 小米钱包 - 玩家视界每日任务自动化脚本 (精简重构版)
  * 适配环境: AutoJs6 (Rhino 引擎) / Android 15 (HyperOS 2)
- * 更新说明:
- *  1. 准确捕获“做任务 领时长”终态标志：识别到该文案立即判定所有视频观看已全部完成并终止视频循环；
- *  2. 点击“做任务 领时长”顺畅切入后续任务列表（浏览任务与最终领奖）；
- *  3. 完善弹窗开奖与多轮再看激励链路。
  */
 
-// 全局配置参数
 var CONFIG = {
-    packageName: "com.mipay.wallet",
+    packageName: "com.mipay.wallet",                // 小米钱包主包名
     assistantPackage: "com.miui.personalassistant", // 负一屏（智能助理）包名
-    browseDurationSec: 17, // 深度浏览任务停留时长
-    watchDurationSec: 13, // 广告观看实际安全停留时长
-    maxTaskCycles: 12, // 最大单轮任务循环上限
-    maxRepeatWatchCycles: 6, // 最大连续“再看10秒继续领”轮次，防止死循环
-    swipeIntervalMs: 2500, // 浏览时滑动间隔
-    actionTimeoutMs: 5000, // 基础元素查找超时
-    // 高危与黑名单任务关键词，匹配即跳过
-    blacklistTasks: [
-        "下载",
-        "安装",
-        "充值",
-        "开通",
-        "借款",
-        "办卡",
-        "投资",
-        "购买",
-    ],
+    maxRightSwipes: 10,                             // 桌面切入负一屏的最大向右滑动次数 (识别到负一屏即提前停止)
+    maxScrollAttempts: 8,                          // 负一屏内寻找底部入口的最大向下滑动次数 (检索到入口即提前停止)
+    browseDurationSec: 17,                         // 深度浏览任务的停留交互秒数
+    watchDurationSec: 13,                          // 激励视频观看的实际安全停留秒数
+    maxTaskCycles: 12,                             // 单轮任务列表轮询的最大任务数上限
+    maxRepeatWatchCycles: 6,                       // 连续观看激励视频与再看领取的最大轮次上限
+    blacklistTasks: [                              // 高危与黑名单任务关键词 (匹配即跳过)
+        "下载", "安装", "充值", "开通", "借款", "办卡", "投资", "购买"
+    ]
 };
 
 /**
- * 健壮性点击工具：逐级向父节点回溯可点击属性，最后回退至控件物理中心坐标点击
+ * 健壮性点击：节点点击 -> 父级回溯 -> 物理坐标兜底
  */
 function safeClick(node) {
     if (!node) return false;
-    if (node.clickable && node.click()) {
-        return true;
-    }
-    // 递归查找可点击的父级 ViewGroup
-    var current = node.parent();
-    var depth = 0;
+    if (node.clickable && node.click()) return true;
+    var current = node.parent(), depth = 0;
     while (current && depth < 4) {
-        if (current.clickable && current.click()) {
-            return true;
-        }
+        if (current.clickable && current.click()) return true;
         current = current.parent();
         depth++;
     }
-    // 兜底方案：计算控件在屏幕上的物理中心点坐标并点击
     var bounds = node.bounds();
     if (bounds && bounds.width() > 0 && bounds.height() > 0) {
         return click(bounds.centerX(), bounds.centerY());
@@ -56,458 +36,351 @@ function safeClick(node) {
     return false;
 }
 
-function WalletTaskManager() {
-    this.processedTaskTitles = {};
+/**
+ * 屏幕物理滑动辅助函数 (避开全面屏边缘手势区)
+ */
+function swipePage(yStartRatio, yEndRatio, duration) {
+    var halfX = Math.floor(device.width / 2 + (Math.random() * 30 - 15));
+    var y1 = Math.floor(device.height * yStartRatio);
+    var y2 = Math.floor(device.height * yEndRatio);
+    swipe(halfX, y1, halfX, y2, duration || 450);
 }
 
 /**
- * 校验无障碍与悬浮窗运行上下文
+ * 弹窗与权限拦截统一处理器
  */
-WalletTaskManager.prototype.initEnvironment = function () {
-    console.show();
-    console.setTitle("玩家视界任务执行器");
-    console.log("正在校验运行权限...");
-
-    auto.waitFor(); // 确保无障碍服务已启动
-    device.keepScreenDim(600 * 1000); // 运行期间保持屏幕常亮
-    console.log("环境就绪，准备调度应用。");
-};
-
-/**
- * 核心拦截：处理 HyperOS 跨应用互跳授权弹窗（例如：钱包 想要打开 闲鱼）
- */
-WalletTaskManager.prototype.handleAppLaunchPermission = function () {
-    var allowBtn =
-        text("本次允许").visibleToUser(true).findOnce() ||
-        text("允许").visibleToUser(true).findOnce() ||
-        text("始终允许").visibleToUser(true).findOnce();
-
+function handlePopups() {
+    // 1. 系统跨应用互跳授权放行 (如闲鱼)
+    var allowBtn = textMatches(/^(本次允许|允许|始终允许)$/).visibleToUser(true).findOnce();
     if (allowBtn) {
-        console.log(
-            "检测到系统授权弹窗，主动点击 [" + allowBtn.text() + "] 放行跳转...",
-        );
+        console.log("放行系统授权弹窗 [" + allowBtn.text() + "]...");
         safeClick(allowBtn);
-        sleep(3000); // 等待目标第三方应用加载到前台
+        sleep(2500);
         return true;
     }
-    return false;
-};
 
-/**
- * 核心拦截：处理“领取奖励”大红包弹窗与“開”字按钮
- */
-WalletTaskManager.prototype.handleRedPacketPopup = function () {
-    var rewardTitle =
-        textContains("领取奖励").visibleToUser(true).findOnce() ||
-        descContains("领取奖励").visibleToUser(true).findOnce();
-
-    if (rewardTitle || text("開").exists() || text("开").exists()) {
-        console.log("检测到 [领取奖励] 红包浮层，准备开奖...");
-
-        // 优先匹配中心“開”/“开”字按钮
-        var openBtn =
-            textMatches(/^(開|开)$/)
-                .visibleToUser(true)
-                .findOnce() ||
-            descMatches(/^(開|开)$/)
-                .visibleToUser(true)
-                .findOnce();
-
+    // 2. 领取奖励大红包弹窗开奖
+    var hasReward = textContains("领取奖励").visibleToUser(true).exists() || text("開").exists() || text("开").exists();
+    if (hasReward) {
+        var openBtn = textMatches(/^(開|开)$/).visibleToUser(true).findOnce() || descMatches(/^(開|开)$/).visibleToUser(true).findOnce();
         if (openBtn) {
-            console.log("找到红包 [開] 按钮，执行点击...");
             safeClick(openBtn);
-            sleep(2500);
         } else {
-            console.log("未直接捕获到 [開] 文本节点，执行红包物理中心盲点...");
             click(Math.floor(device.width / 2), Math.floor(device.height * 0.44));
-            sleep(2500);
         }
-
-        // 开奖完成后若出现“再看10秒 继续领会员”，保留弹窗以便连环领取
-        if (textContains("再看").exists() || textContains("继续领会员").exists()) {
-            console.log("开奖完成，检测到支持 [继续领取]，保持弹窗...");
-            return true;
-        }
-
-        return true;
-    }
-    return false;
-};
-
-/**
- * 防御性弹窗关闭（业务签到成功、通告蒙层、圆圈叉号等）
- * 注意：当弹窗存在“再看10秒 继续领会员”时自动豁免，不触发关闭
- */
-WalletTaskManager.prototype.dismissPopups = function () {
-    this.handleAppLaunchPermission();
-
-    // 豁免保护：存在继续领会员按钮时不点关闭
-    if (textContains("再看").exists() || textContains("继续领会员").exists()) {
-        return;
+        sleep(2500);
+        if (textContains("再看").exists() || textContains("继续领会员").exists()) return true;
     }
 
-    var closeKeywords = ["关闭", "我知道了", "开心收下", "放弃", "取消"];
-    for (var i = 0; i < closeKeywords.length; i++) {
-        var kw = closeKeywords[i];
-        var closeBtn = text(kw).visibleToUser(true).findOnce();
-        if (closeBtn) {
-            console.log("检测到业务干扰弹窗 [" + kw + "]，正在关闭...");
-            safeClick(closeBtn);
-            sleep(1000);
-        }
-    }
+    // 3. 干扰弹窗关闭 (若存在继续领会员则豁免关闭)
+    if (textContains("再看").exists() || textContains("继续领会员").exists()) return false;
 
-    // 匹配红包或弹窗底部的关闭图标 (X)
-    var closeIcon =
-        descMatches(/关闭|close/i)
-            .visibleToUser(true)
-            .findOnce() ||
-        idMatches(/.*close.*/)
-            .visibleToUser(true)
-            .findOnce();
+    var closeBtn = textMatches(/^(关闭|我知道了|开心收下|放弃|取消)$/).visibleToUser(true).findOnce();
+    if (closeBtn) {
+        safeClick(closeBtn);
+        sleep(1000);
+    }
+    var closeIcon = descMatches(/关闭|close/i).visibleToUser(true).findOnce() || idMatches(/.*close.*/).visibleToUser(true).findOnce();
     if (closeIcon) {
         safeClick(closeIcon);
         sleep(1000);
     }
-};
+    return false;
+}
 
 /**
- * 入口重构：从 HyperOS 负一屏最底部进入“玩家视界”
+ * 模拟停留交互并维持滑动 (采用硬性截止时间，避免外部应用死锁卡死)
  */
-WalletTaskManager.prototype.launchFromNegativeOneScreen = function () {
-    console.log("检查当前页面状态...");
-    this.dismissPopups();
+function simulateStay(durationSec) {
+    var deadline = Date.now() + durationSec * 1000;
+    while (Date.now() < deadline) {
+        var allowBtn = textMatches(/^(本次允许|允许|始终允许)$/).visibleToUser(true).findOnce();
+        if (allowBtn) {
+            safeClick(allowBtn);
+            sleep(2000);
+        }
+        swipePage(0.72, 0.35, 550);
+        sleep(2200 + Math.floor(Math.random() * 500));
+    }
+}
 
-    // 检查是否已经在“玩家视界”页面
-    if (text("玩家视界").exists() || textContains("我的会员时长").exists()) {
-        console.log("当前已处于 [玩家视界] 目标页面，跳过前置导航。");
-        return;
+/**
+ * 以权威包名 (CONFIG.packageName) 为核心基准切回活动面板
+ */
+function backToPanel() {
+    console.log("正在切回小米钱包活动页面...");
+    // 1. 若当前不在钱包，优先尝试 2 次系统级回退
+    for (var i = 0; i < 2; i++) {
+        if (currentPackage() === CONFIG.packageName) break;
+        back();
+        sleep(900);
     }
 
-    console.log("尝试唤起负一屏（智能助理）...");
-    var launched = app.launchPackage(CONFIG.assistantPackage);
-    sleep(2000);
-
-    // 校验是否成功进入负一屏，若未直接拉起则通过桌面右划手势进入
-    if (
-        !textContains("去支付").exists() &&
-        !textContains("生活小助手").exists() &&
-        !textContains("视界").exists()
-    ) {
-        console.log("通过包名未拉起负一屏，切换为桌面手势：回到主页并向右滑动...");
-        home();
-        sleep(1500);
-        swipe(
-            80,
-            Math.floor(device.height / 2),
-            Math.floor(device.width * 0.85),
-            Math.floor(device.height / 2),
-            350,
-        );
+    // 2. 防御性保障：若仍被外部应用拦截，强制将钱包从后台唤醒至前台
+    if (currentPackage() !== CONFIG.packageName) {
+        console.log("检测到仍停留在外部应用，强制唤醒钱包回前台...");
+        app.launchPackage(CONFIG.packageName);
         sleep(2500);
     }
 
-    console.log("向下滑动至负一屏最底部寻找 [去领会员]...");
-    var foundEntrance = false;
+    // 3. 确认回到钱包后，处理开奖浮层与领奖
+    handlePopups();
+    sleep(1500);
+}
 
-    for (var scroll = 0; scroll < 6; scroll++) {
-        var entranceBtn =
-            text("去领会员").visibleToUser(true).findOnce() ||
-            desc("去领会员").visibleToUser(true).findOnce();
+/**
+ * 校验节点物理坐标是否真正在当前屏幕物理可视区域内
+ * 彻底过滤处于屏幕外预加载区 (x < 0 或 x > width) 的幽灵节点
+ */
+function isNodeOnScreen(node) {
+    if (!node) return false;
+    var b = node.bounds();
+    if (!b) return false;
+    return b.centerX() > 0 && b.centerX() < device.width && b.centerY() > 0 && b.centerY() < device.height;
+}
 
-        if (entranceBtn) {
-            console.log("成功在负一屏底部定位到 [去领会员]，点击进入...");
-            safeClick(entranceBtn);
-            sleep(4000);
-            foundEntrance = true;
+/**
+ * 校验当前是否依然停留在桌面 (排他性排查)
+ * 桌面独有标志：底部常驻 Dock 栏 (电话/短信/相机等) 或底部桌面搜索胶囊 (处于屏幕下部)
+ */
+function isStillOnHomeScreen() {
+    // 1. 检查底部的桌面搜索胶囊 (处于屏幕下方 y > height * 0.75)
+    var searchNodes = text("搜索").visibleToUser(true).find();
+    if (searchNodes.nonEmpty()) {
+        for (var s = 0; s < searchNodes.length; s++) {
+            var sb = searchNodes[s].bounds();
+            if (sb && sb.centerY() > device.height * 0.75) {
+                return true;
+            }
+        }
+    }
+
+    // 2. 检查桌面底部常驻 Dock 应用 (处于屏幕下方 y > height * 0.8)
+    var dockKeywords = ["电话", "拨号", "短信", "相机", "联系人", "浏览器"];
+    for (var i = 0; i < dockKeywords.length; i++) {
+        var node = text(dockKeywords[i]).visibleToUser(true).findOnce() ||
+            desc(dockKeywords[i]).visibleToUser(true).findOnce();
+        if (node) {
+            var b = node.bounds();
+            if (b && b.centerY() > device.height * 0.8) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/**
+ * 校验当前是否处于负一屏真实可视界面
+ * 严谨前提：底部的桌面 Dock 栏已完全脱离屏幕
+ */
+function isAtNegativeOneScreen() {
+    // 只要屏幕底部依然存在桌面 Dock 栏或底部搜索胶囊，坚决判定为“仍在桌面”
+    if (isStillOnHomeScreen()) return false;
+
+    if (currentPackage() === CONFIG.assistantPackage) return true;
+
+    // 负一屏顶部特有搜索栏 (处于屏幕顶部 y < height * 0.25)
+    var searchNodes = text("搜索").visibleToUser(true).find();
+    if (searchNodes.nonEmpty()) {
+        for (var s = 0; s < searchNodes.length; s++) {
+            var sb = searchNodes[s].bounds();
+            if (sb && sb.centerY() < device.height * 0.25 && sb.centerX() > 0 && sb.centerX() < device.width) {
+                return true;
+            }
+        }
+    }
+
+    // 负一屏顶部快捷功能 (扫一扫、付款码等)
+    var scan = text("扫一扫").visibleToUser(true).findOnce();
+    var pay = text("付款码").visibleToUser(true).findOnce();
+    if (isNodeOnScreen(scan) || isNodeOnScreen(pay)) {
+        return true;
+    }
+
+    var entrance = idEndsWith("video_member_btn").visibleToUser(true).findOnce() ||
+        textMatches(/.*去领会员.*/).visibleToUser(true).findOnce();
+    if (isNodeOnScreen(entrance)) return true;
+
+    return false;
+}
+
+/**
+ * 负一屏入口导航：默认向右滑动一次后判断，循环推进直至到达最左侧负一屏
+ */
+function launchFromNegativeOneScreen() {
+    handlePopups();
+    if (text("玩家视界").exists() || textContains("我的会员时长").exists()) {
+        console.log("当前已处于 [玩家视界] 页面，跳过前置导航。");
+        return true;
+    }
+
+    console.log("回到主页，向右滑动穿透至最左侧负一屏...");
+    home();
+    sleep(1500);
+
+    // 默认滑动一次后判断是否已离开桌面并切入负一屏，若未离开则持续右划 (上限 maxRightSwipes 次)
+    var reached = false;
+    for (var swipeAttempt = 1; swipeAttempt <= CONFIG.maxRightSwipes; swipeAttempt++) {
+        console.log("向右滑动切换至最左侧负一屏 (第 " + swipeAttempt + " 次)...");
+        var startX = Math.floor(device.width * 0.2);
+        var endX = Math.floor(device.width * 0.88);
+        var swipeY = Math.floor(device.height * 0.55);
+        swipe(startX, swipeY, endX, swipeY, 360);
+        sleep(1400);
+
+        if (isAtNegativeOneScreen()) {
+            reached = true;
+            console.log("已成功识别并切入最左侧负一屏。");
             break;
         }
+    }
 
-        scrollDown();
+    if (!reached) {
+        console.warn("未完全匹配到负一屏特有组件标记，继续尝试检索底部入口...");
+    }
+
+    console.log("在负一屏向下滑动寻找最底部 [去领会员]...");
+    for (var scroll = 0; scroll < CONFIG.maxScrollAttempts; scroll++) {
+        var entrance = idEndsWith("video_member_btn").visibleToUser(true).findOnce() ||
+            textMatches(/.*去领会员.*/).visibleToUser(true).findOnce() ||
+            descMatches(/.*去领会员.*/).visibleToUser(true).findOnce() ||
+            text("玩家视界").visibleToUser(true).findOnce();
+        if (entrance && isNodeOnScreen(entrance)) {
+            var title = entrance.id() ? "video_member_btn (视频会员按钮)" : (entrance.text() || entrance.desc() || "去领会员");
+            console.log("成功定位到负一屏底部入口 [" + title + "]，点击进入...");
+            safeClick(entrance);
+            sleep(4000);
+            handlePopups();
+            return true;
+        }
+        swipePage(0.75, 0.25, 450);
         sleep(1200);
     }
 
-    if (!foundEntrance) {
-        console.warn(
-            "负一屏未能成功检索到底部 [去领会员]，启用小米钱包常规入口兜底...",
-        );
-        this.launchTargetPageFallback();
-    }
-
-    this.dismissPopups();
-};
+    console.error("未能检索到底部 [去领会员] 入口，安全终止。");
+    return false;
+}
 
 /**
- * 钱包常规入口兜底导航（备用策略）
+ * 观看激励视频与多轮领会员循环
  */
-WalletTaskManager.prototype.launchTargetPageFallback = function () {
-    app.launchPackage(CONFIG.packageName);
-    sleep(3500);
-    this.dismissPopups();
-
-    var vipEntrance =
-        text("领视频会员").visibleToUser(true).findOnce() ||
-        textContains("领视频会员").visibleToUser(true).findOnce();
-    if (vipEntrance) {
-        safeClick(vipEntrance);
-        sleep(4000);
-    }
-};
-
-/**
- * 核心任务：处理连环“再看10秒 继续领会员”，检测到“做任务 领时长”时自动终止并切入后续列表
- */
-WalletTaskManager.prototype.handleMainVipButton = function () {
-    console.log("启动主激励视频/领会员循环...");
-    var loopCount = 0;
-
-    while (loopCount < CONFIG.maxRepeatWatchCycles) {
-        loopCount++;
-
-        // 终态条件检查：检测是否已变为“做任务 领时长”，表示全部视频跳转已达成
-        var finishBtn =
-            textContains("做任务 领时长").visibleToUser(true).findOnce() ||
+function watchAdsLoop() {
+    console.log("启动主激励视频与领会员循环...");
+    for (var i = 1; i <= CONFIG.maxRepeatWatchCycles; i++) {
+        var finishBtn = textContains("做任务 领时长").visibleToUser(true).findOnce() ||
             descContains("做任务 领时长").visibleToUser(true).findOnce();
-
         if (finishBtn) {
-            console.log(
-                "检测到按钮变为 [做任务 领时长]，表明本次全部视频跳转奖励已完成！",
-            );
-            // 点击它以切入任务中心或直接关闭浮层
-            safeClick(finishBtn);
-            sleep(2500);
-            this.dismissPopups();
-            break; // 退出视频循环，顺利进入后续任务流
+            console.log("检测到按钮变为 [做任务 领时长]，今日会员时长全部奖励已达成！流程圆满结束。");
+            return true;
         }
 
-        // 1. 优先匹配弹窗中的“再看10秒 继续领会员”
-        var targetBtn =
-            textMatches(/.*再看\d+秒.*继续领会员.*/)
-                .visibleToUser(true)
-                .findOnce() ||
+        var targetBtn = textMatches(/.*再看\d+秒.*继续领会员.*/).visibleToUser(true).findOnce() ||
             textContains("再看10秒").visibleToUser(true).findOnce() ||
-            textContains("继续领会员").visibleToUser(true).findOnce();
-
-        // 2. 若弹窗中无，则检索页面主位置的大按钮（看10秒 领会员 / 点击领会员）
-        if (!targetBtn) {
-            targetBtn =
-                textMatches(/^(看\d+秒.*领会员|点击领会员|去领会员|立即领会员)$/)
-                    .visibleToUser(true)
-                    .findOnce() || textContains("领会员").visibleToUser(true).findOnce();
-        }
+            textContains("继续领会员").visibleToUser(true).findOnce() ||
+            textMatches(/^(看\d+秒.*领会员|点击领会员|去领会员|立即领会员)$/).visibleToUser(true).findOnce() ||
+            textContains("领会员").visibleToUser(true).findOnce();
 
         if (!targetBtn) {
-            console.log(
-                "当前屏幕未检索到更多可继续观看/领取的按钮，主激励循环结束。",
-            );
+            console.log("未检索到更多可继续观看/领取的按钮，主循环结束。");
             break;
         }
 
-        var btnText = targetBtn.text() || "操作按钮";
-
-        // 二次防御：若捕获到的主按钮本身已是“做任务 领时长”，则直接终止
+        var btnText = targetBtn.text() || targetBtn.desc() || "操作按钮";
         if (btnText.indexOf("做任务 领时长") !== -1) {
-            console.log("主按钮已更新为 [做任务 领时长]，所有视频跳转已全部完成。");
-            break;
+            console.log("检测到按钮为 [做任务 领时长]，今日会员时长已全额到账！流程圆满结束。");
+            return true;
         }
 
-        console.log("执行第 [" + loopCount + "] 轮操作: [" + btnText + "]...");
+        console.log("执行第 [" + i + "] 轮: [" + btnText + "]...");
         safeClick(targetBtn);
         sleep(2000);
+        handlePopups();
 
-        // 处理系统跨应用跳转授权（如闲鱼）
-        this.handleAppLaunchPermission();
-
-        // 若文案包含“看”或“秒”，则进入倒计时与模拟交互
         if (btnText.indexOf("看") !== -1 || btnText.indexOf("秒") !== -1) {
             console.log("进入观看交互，计时 " + CONFIG.watchDurationSec + " 秒...");
-            var startTime = Date.now();
-            var targetDurationMs = CONFIG.watchDurationSec * 1000;
-            var width = device.width;
-            var height = device.height;
-
-            while (Date.now() - startTime < targetDurationMs) {
-                if (this.handleAppLaunchPermission()) {
-                    console.log("已放行应用跳转，重置有效浏览计时...");
-                    startTime = Date.now();
-                }
-
-                var x = Math.floor(width / 2 + (Math.random() * 40 - 20));
-                var yStart = Math.floor(height * 0.7 + (Math.random() * 50 - 25));
-                var yEnd = Math.floor(height * 0.4 + (Math.random() * 50 - 25));
-                swipe(x, yStart, x, yEnd, 600);
-                sleep(2800 + Math.floor(Math.random() * 500));
-            }
-
-            console.log("观看时长达标，回退至玩家视界...");
-            this.safeBackToTaskList();
-            sleep(2500);
+            simulateStay(CONFIG.watchDurationSec);
+            backToPanel();
+            sleep(2000);
         }
 
-        // 看完返回后，优先开红包
-        this.handleRedPacketPopup();
+        handlePopups();
+        if (textContains("做任务 领时长").visibleToUser(true).exists() || descContains("做任务 领时长").visibleToUser(true).exists()) {
+            console.log("开奖完成，检测到按钮更新为 [做任务 领时长]，今日时长已全部领满！");
+            return true;
+        }
 
-        // 检查返回后是否变为“点击领会员”
         var claimBtn = text("点击领会员").visibleToUser(true).findOnce();
         if (claimBtn) {
-            console.log("检测到主按钮变为 [点击领会员]，点击领奖...");
             safeClick(claimBtn);
-            sleep(2500);
-            this.handleRedPacketPopup();
+            sleep(2000);
+            handlePopups();
         }
-
-        sleep(1500);
+        sleep(1000);
     }
-
-    // 循环结束后若仍残留弹窗则执行关闭
-    this.dismissPopups();
-    console.log("视频跳转与主激励流程处理完毕。");
-};
+    handlePopups();
+    return false;
+}
 
 /**
- * 检查并进入下方的“做任务 加速领5天+会员”列表
+ * 展开深度任务中心列表
  */
-WalletTaskManager.prototype.enterDetailTasks = function () {
-    console.log("检查 [做任务 加速领] 深度任务通道...");
-    this.dismissPopups();
-
-    var taskEntrance =
-        textContains("加速领").visibleToUser(true).findOnce() ||
+function enterTaskCenter() {
+    console.log("检查深度任务通道入口...");
+    handlePopups();
+    var taskEntrance = textContains("加速领").visibleToUser(true).findOnce() ||
         textContains("做任务 加速").visibleToUser(true).findOnce() ||
         textContains("做任务 领时长").visibleToUser(true).findOnce();
 
     if (taskEntrance) {
-        console.log("发现任务通道入口，尝试展开任务列表...");
         var goBtn = text("去领取").visibleToUser(true).findOnce();
-        if (goBtn) {
-            safeClick(goBtn);
-        } else {
-            safeClick(taskEntrance);
-        }
-        sleep(3500);
-        this.dismissPopups();
+        safeClick(goBtn || taskEntrance);
+        sleep(3000);
+        handlePopups();
     }
-};
+}
 
 /**
- * 校验任务标题是否命中安全黑名单
+ * 校验黑名单任务
  */
-WalletTaskManager.prototype.isBlacklisted = function (taskNode) {
-    var taskTitle = "";
+function isBlacklisted(taskNode) {
     try {
         var parent = taskNode.parent();
         if (parent) {
             var titleNode = parent.findOne(textMatches(/.+/));
             if (titleNode) {
-                taskTitle = titleNode.text();
+                var title = titleNode.text();
+                for (var i = 0; i < CONFIG.blacklistTasks.length; i++) {
+                    if (title.indexOf(CONFIG.blacklistTasks[i]) !== -1) {
+                        console.warn("跳过黑名单任务: [" + title + "]");
+                        return true;
+                    }
+                }
             }
         }
     } catch (e) { }
-
-    for (var i = 0; i < CONFIG.blacklistTasks.length; i++) {
-        var word = CONFIG.blacklistTasks[i];
-        if (taskTitle.indexOf(word) !== -1) {
-            console.warn("跳过黑名单任务: [" + taskTitle + "] (包含: " + word + ")");
-            return true;
-        }
-    }
     return false;
-};
+}
 
 /**
- * 模拟深度页面浏览
+ * 轮询执行普通浏览任务
  */
-WalletTaskManager.prototype.simulateBrowse = function () {
-    console.log(
-        "进入任务浏览页，维持模拟交互 " + CONFIG.browseDurationSec + " 秒...",
-    );
-    var startTime = Date.now();
-    var targetDurationMs = CONFIG.browseDurationSec * 1000;
-    var width = device.width;
-    var height = device.height;
-
-    while (Date.now() - startTime < targetDurationMs) {
-        if (this.handleAppLaunchPermission()) {
-            startTime = Date.now();
-        }
-
-        var x = Math.floor(width / 2 + (Math.random() * 40 - 20));
-        var yStart = Math.floor(height * 0.7 + (Math.random() * 50 - 25));
-        var yEnd = Math.floor(height * 0.35 + (Math.random() * 50 - 25));
-        swipe(x, yStart, x, yEnd, 600);
-        sleep(CONFIG.swipeIntervalMs + Math.floor(Math.random() * 500));
-    }
-
-    console.log("浏览时长达成，执行安全回退...");
-    this.safeBackToTaskList();
-};
-
-/**
- * 安全回退校准机制，支持跨应用返回与前台强制拉回
- */
-WalletTaskManager.prototype.safeBackToTaskList = function () {
-    var retryCount = 0;
-    var maxRetries = 6;
-
-    while (retryCount < maxRetries) {
-        if (
-            currentPackage() === CONFIG.packageName &&
-            (text("玩家视界").exists() ||
-                textContains("看10秒").exists() ||
-                textContains("再看").exists() ||
-                textContains("做任务").exists() ||
-                textContains("加速领").exists() ||
-                textMatches(/(去完成|做任务|可领取|领取)/).exists())
-        ) {
-            console.log("已确认成功回退到目标面板。");
-            return;
-        }
-
-        back();
-        sleep(1800);
-        this.dismissPopups();
-        retryCount++;
-    }
-
-    if (currentPackage() !== CONFIG.packageName) {
-        console.log("仍停留在外部应用，主动唤醒小米钱包回到前台...");
-        app.launchPackage(CONFIG.packageName);
-        sleep(3000);
-        this.dismissPopups();
-    }
-};
-
-/**
- * 轮询处理普通任务列表
- */
-WalletTaskManager.prototype.processTasksLoop = function () {
+function runTasksLoop() {
     console.log("开始轮询执行任务列表...");
-    var cycle = 0;
-
-    while (cycle < CONFIG.maxTaskCycles) {
-        cycle++;
-        this.dismissPopups();
-
-        var actionBtn = textMatches(/^(去完成|去浏览|去查看|逛一逛)$/)
-            .visibleToUser(true)
-            .findOnce();
-
+    for (var cycle = 1; cycle <= CONFIG.maxTaskCycles; cycle++) {
+        handlePopups();
+        var actionBtn = textMatches(/^(去完成|去浏览|去查看|逛一逛)$/).visibleToUser(true).findOnce();
         if (!actionBtn) {
-            console.log("当前屏幕未发现可继续执行的任务按钮，尝试下翻查找...");
             scrollDown();
             sleep(1500);
-
-            actionBtn = textMatches(/^(去完成|去浏览|去查看|逛一逛)$/)
-                .visibleToUser(true)
-                .findOnce();
-
+            actionBtn = textMatches(/^(去完成|去浏览|去查看|逛一逛)$/).visibleToUser(true).findOnce();
             if (!actionBtn) {
-                console.log("未能检索到更多符合条件的交互任务，结束轮询。");
+                console.log("未发现更多可用交互任务，结束轮询。");
                 break;
             }
         }
 
-        if (this.isBlacklisted(actionBtn)) {
+        if (isBlacklisted(actionBtn)) {
             scrollDown();
             sleep(1000);
             continue;
@@ -516,59 +389,65 @@ WalletTaskManager.prototype.processTasksLoop = function () {
         console.log("执行第 [" + cycle + "] 项任务...");
         safeClick(actionBtn);
         sleep(2500);
-
-        this.simulateBrowse();
-        sleep(2000);
+        simulateStay(CONFIG.browseDurationSec);
+        backToPanel();
+        sleep(1500);
     }
-};
+}
 
 /**
  * 批量收割已完成的奖励
  */
-WalletTaskManager.prototype.collectAllRewards = function () {
+function claimRewards() {
     console.log("检查并收集待领取奖励...");
-    this.dismissPopups();
-
-    var rewardButtons = textMatches(/^(领取|可领取|点击领取)$/)
-        .visibleToUser(true)
-        .find();
-    if (rewardButtons.nonEmpty()) {
-        console.log("找到 " + rewardButtons.length + " 个可领取奖励。");
-        for (var i = 0; i < rewardButtons.length; i++) {
-            var btn = rewardButtons[i];
-            console.log("领取第 " + (i + 1) + " 个奖励...");
-            safeClick(btn);
+    handlePopups();
+    var list = textMatches(/^(领取|可领取|点击领取)$/).visibleToUser(true).find();
+    if (list.nonEmpty()) {
+        console.log("找到 " + list.length + " 个待领取奖励。");
+        for (var i = 0; i < list.length; i++) {
+            safeClick(list[i]);
             sleep(1200);
-            this.dismissPopups();
+            handlePopups();
         }
-    } else {
-        console.log("当前无待领取的奖励节点。");
     }
-};
+}
 
 /**
- * 释放与清理
+ * 主执行入口
  */
-WalletTaskManager.prototype.finalize = function () {
+function main() {
+    console.show();
+    console.setTitle("玩家视界任务执行器");
+    console.log("正在校验运行权限...");
+    auto.waitFor();
+    device.keepScreenDim(600 * 1000);
+    console.log("环境就绪，准备调度应用。");
+
+    var launched = launchFromNegativeOneScreen();
+    if (!launched) {
+        console.error("未能进入活动页面，脚本安全终止。");
+        device.cancelKeepingAwake();
+        return;
+    }
+
+    var allDone = watchAdsLoop();
+    if (allDone) {
+        console.log("===============================");
+        console.log("检测到 [做任务 领时长] 终态，今日会员时长已全额领取达成！");
+        console.log("自动化流程圆满结束。");
+        console.log("===============================");
+        device.cancelKeepingAwake();
+        return;
+    }
+
+    enterTaskCenter();
+    runTasksLoop();
+    claimRewards();
+
     device.cancelKeepingAwake();
     console.log("===============================");
     console.log("全部任务流程执行完毕。");
     console.log("===============================");
-};
+}
 
-/**
- * 主控制流程
- */
-WalletTaskManager.prototype.run = function () {
-    this.initEnvironment();
-    this.launchFromNegativeOneScreen(); // 1. 负一屏底部“去领会员”启动
-    this.handleMainVipButton(); // 2. 连续观看广告直到出现“做任务 领时长”终止
-    this.enterDetailTasks(); // 3. 点击“做任务 加速领5天+会员”
-    this.processTasksLoop(); // 4. 轮询完成子任务
-    this.collectAllRewards(); // 5. 收割全部奖励
-    this.finalize();
-};
-
-// 启动执行
-var manager = new WalletTaskManager();
-manager.run();
+main();
